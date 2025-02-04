@@ -240,91 +240,63 @@ func (cs *checkout) Watch(req *healthpb.HealthCheckRequest, ws healthpb.Health_W
 }
 
 func (cs *checkout) PlaceOrder(ctx context.Context, req *pb.PlaceOrderRequest) (*pb.PlaceOrderResponse, error) {
-	span := trace.SpanFromContext(ctx)
+	ctx, span := tracer.Start(ctx, "PlaceOrder")
+	defer span.End()
+
 	span.SetAttributes(
 		attribute.String("app.user.id", req.UserId),
 		attribute.String("app.user.currency", req.UserCurrency),
 	)
-	log.Infof("[PlaceOrder] user_id=%q user_currency=%q", req.UserId, req.UserCurrency)
-
-	var err error
-	defer func() {
-		if err != nil {
-			span.AddEvent("error", trace.WithAttributes(semconv.ExceptionMessageKey.String(err.Error())))
-		}
-	}()
+	log.WithFields(logrus.Fields{
+		"app.user.id":       req.UserId,
+		"app.user.currency": req.UserCurrency,
+	}).Info("Processing order")
 
 	orderID, err := uuid.NewUUID()
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to generate order uuid")
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "failed to generate order UUID")
+		log.WithError(err).Error("Failed to generate order UUID")
+		return nil, status.Errorf(codes.Internal, "failed to generate order UUID")
 	}
+
+	log.WithField("app.order.id", orderID.String()).Info("Generated order ID")
 
 	prep, err := cs.prepareOrderItemsAndShippingQuoteFromCart(ctx, req.UserId, req.UserCurrency, req.Address)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "failed to prepare order")
+		log.WithError(err).Error("Order preparation failed")
 		return nil, status.Errorf(codes.Internal, err.Error())
 	}
-	span.AddEvent("prepared")
 
-	total := &pb.Money{CurrencyCode: req.UserCurrency,
-		Units: 0,
-		Nanos: 0}
+	total := &pb.Money{CurrencyCode: req.UserCurrency, Units: 0, Nanos: 0}
 	total = money.Must(money.Sum(total, prep.shippingCostLocalized))
 	for _, it := range prep.orderItems {
 		multPrice := money.MultiplySlow(it.Cost, uint32(it.GetItem().GetQuantity()))
 		total = money.Must(money.Sum(total, multPrice))
 	}
 
-	txID, err := cs.chargeCard(ctx, total, req.CreditCard)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to charge card: %+v", err)
-	}
-	log.Infof("payment went through (transaction_id: %s)", txID)
-	span.AddEvent("charged",
-		trace.WithAttributes(attribute.String("app.payment.transaction.id", txID)))
-
 	shippingTrackingID, err := cs.shipOrder(ctx, req.Address, prep.cartItems)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "shipping error")
+		log.WithError(err).Error("Shipping error")
 		return nil, status.Errorf(codes.Unavailable, "shipping error: %+v", err)
 	}
-	shippingTrackingAttribute := attribute.String("app.shipping.tracking.id", shippingTrackingID)
-	span.AddEvent("shipped", trace.WithAttributes(shippingTrackingAttribute))
 
-	_ = cs.emptyUserCart(ctx, req.UserId)
+	span.AddEvent("shipped", trace.WithAttributes(attribute.String("app.shipping.tracking.id", shippingTrackingID)))
 
-	orderResult := &pb.OrderResult{
-		OrderId:            orderID.String(),
-		ShippingTrackingId: shippingTrackingID,
-		ShippingCost:       prep.shippingCostLocalized,
-		ShippingAddress:    req.Address,
-		Items:              prep.orderItems,
-	}
+	log.WithFields(logrus.Fields{
+		"app.order.id":               orderID.String(),
+		"app.shipping.tracking.id":   shippingTrackingID,
+		"app.order.total.amount":     fmt.Sprintf("%d.%02d", total.GetUnits(), total.GetNanos()/1000000000),
+		"app.order.items.count":      len(prep.orderItems),
+	}).Info("Order successfully placed")
 
-	shippingCostFloat, _ := strconv.ParseFloat(fmt.Sprintf("%d.%02d", prep.shippingCostLocalized.GetUnits(), prep.shippingCostLocalized.GetNanos()/1000000000), 64)
-	totalPriceFloat, _ := strconv.ParseFloat(fmt.Sprintf("%d.%02d", total.GetUnits(), total.GetNanos()/1000000000), 64)
-
-	span.SetAttributes(
-		attribute.String("app.order.id", orderID.String()),
-		attribute.Float64("app.shipping.amount", shippingCostFloat),
-		attribute.Float64("app.order.amount", totalPriceFloat),
-		attribute.Int("app.order.items.count", len(prep.orderItems)),
-		shippingTrackingAttribute,
-	)
-
-	if err := cs.sendOrderConfirmation(ctx, req.Email, orderResult); err != nil {
-		log.Warnf("failed to send order confirmation to %q: %+v", req.Email, err)
-	} else {
-		log.Infof("order confirmation email sent to %q", req.Email)
-	}
-
-	// send to kafka only if kafka broker address is set
-	if cs.kafkaBrokerSvcAddr != "" {
-		log.Infof("sending to postProcessor")
-		cs.sendToPostProcessor(ctx, orderResult)
-	}
-
-	resp := &pb.PlaceOrderResponse{Order: orderResult}
-	return resp, nil
+	return &pb.PlaceOrderResponse{Order: &pb.OrderResult{OrderId: orderID.String(), ShippingTrackingId: shippingTrackingID}}, nil
 }
+
 
 type orderPrep struct {
 	orderItems            []*pb.OrderItem
